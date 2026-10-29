@@ -1,0 +1,28 @@
+name: Windows PAL source validation
+on:
+  push:
+    branches: [verify/windows-pal]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4b91920d29e322eec4ef4e7e4be316b6c6617d6c
+          persist-credentials: false
+      - name: Record source and toolchain
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          cmake --version
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
+      - name: Configure native Windows target
+        run: cmake -S . -B build -A x64
+      - name: Build native Windows target
+        run: cmake --build build --config Release --parallel 2
+      - name: Record executable identity
+        shell: pwsh
+        run: Get-FileHash build/Release/FuturamaRecomp.exe -Algorithm SHA256
