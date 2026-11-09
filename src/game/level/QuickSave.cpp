@@ -13,11 +13,13 @@
 #include "game/object/ChickenWalker.h"
 #include "game/object/Pickup.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fut::game {
@@ -108,7 +110,11 @@ void LevelData::QuickSave() {                         // orig: 0x000C7910 (FsQui
             if (!o->def->IsType(4)) continue;         // vf0C(4): pickups
             const char* defName = o->def->name.c_str();   // (+0x10)+0x10
             if (static_cast<GameObject*>(P->weapon) == o) {   // P+0x528 (the result is not tested)
-                (void)Put(out, "Equip=%s|%d|NULL\n", defName, static_cast<int>(o->id));
+                std::string key = "NULL";
+                if (auto* pk = dynamic_cast<Pickup*>(o)) (void)pk->GetKey(key);   // 0x00076600
+                (void)Put(out, "Equip=%s|%d|%s", defName, static_cast<int>(o->id), key.c_str());
+                if (o->label) (void)Put(out, "|%s", o->label->c_str());
+                (void)Put(out, "\n");
                 continue;
             }
             std::string key = "NULL";                 // 0x002A3888 + zeros (0x40 bytes)
@@ -128,6 +134,20 @@ void LevelData::QuickSave() {                         // orig: 0x000C7910 (FsQui
 void LevelData::QuickLoad() {                         // orig: 0x000C7D40 (FsQuickLoad, native 318)
     Player* P = player;                               // S+0x94
     if (!P) return;
+    struct CarriedItem {
+        Def* def = nullptr;
+        u32 id = 0;
+        std::string label;
+        std::string key = "NULL";
+        bool equipped = false;
+    };
+    std::vector<CarriedItem> carried;
+    for (GameObject* o = P->inventory.NextObject(nullptr); o; o = P->inventory.NextObject(o)) {
+        if (!o->def->IsType(4)) continue;
+        CarriedItem item{o->def, o->id, o->label ? *o->label : std::string(), "NULL", o == P->weapon};
+        if (auto* pk = dynamic_cast<Pickup*>(o)) (void)pk->GetKey(item.key);
+        carried.push_back(std::move(item));
+    }
     P->Reset();                                       // Player::Reset 0x00057680
     if (!quickSave) return;                           // DAT_002EAA40
     IngameEventSet& events = P->cdef.ingameEvents;    // (P+0x10)+0x28
@@ -224,8 +244,53 @@ void LevelData::QuickLoad() {                         // orig: 0x000C7D40 (FsQui
         if (auto* w = dynamic_cast<Weapon*>(equip)) (void)P->SetWeapon(w);   // vfB4
         else NotPorted("FsQuickLoad: an Equip line whose object is not a weapon (vfB4)");
     }
-    quickLoading = false;                             // DAT_002EAA48 = 0
     for (s32 i = 0; i < 5; ++i) P->SetAmmo(i, ammoIn[static_cast<size_t>(i)]);   // 0x00051D50
+    struct ItemIdentity {
+        Def* def;
+        u32 id;
+        std::string label;
+        bool operator==(const ItemIdentity& other) const {
+            return def == other.def && (id || other.id ? id == other.id : label == other.label);
+        }
+    };
+    std::vector<ItemIdentity> restored;
+    for (GameObject* o = P->inventory.NextObject(nullptr); o; o = P->inventory.NextObject(o))
+        if (o->def->IsType(4))
+            restored.push_back({o->def, o->id, o->label ? *o->label : std::string()});
+    GameObject* carriedEquip = nullptr;
+    std::vector<s32> carriedValues;
+    // Level1-1 keeps its running pickup counter during restore, so carried values must not be booked again.
+    const bool bookValue = crt::StrICmp(name.c_str(), "level1-1") != 0;
+    for (const CarriedItem& item : carried) {
+        const ItemIdentity match{item.def, item.id, item.label};
+        auto found = std::find(restored.begin(), restored.end(), match);
+        if (found != restored.end()) {
+            restored.erase(found);
+            continue;
+        }
+        const ni::NiMatrix3 rot{};
+        const ni::NiPoint3 pos{};
+        Owner* owner = stages.empty() ? nullptr : stages.front().get();
+        GameObject* o = item.def->Spawn(*this, owner, pos, rot, nullptr);
+        if (!o) {
+            std::fprintf(stderr, "FsQuickLoad: carried item %.120s spawned nothing\n", item.def->name.c_str());
+            continue;
+        }
+        if (item.key != "NULL")
+            if (auto* pk = dynamic_cast<Pickup*>(o)) pk->ApplyKey(item.key.c_str());   // 0x00076650
+        if (!item.label.empty()) o->SetName(item.label.c_str());   // 0x000968C0
+        if (item.id) o->SetId(item.id);
+        o->SetOwner(&P->inventory);                   // vf10(P+0x38)
+        if (item.id) SetObjFlags(item.id, 3);         // 0x000C1A40
+        if (auto* pd = dynamic_cast<PickupDef*>(item.def)) carriedValues.push_back(pd->value);
+        if (item.equipped) carriedEquip = o;
+    }
+    if (!equip && carriedEquip)
+        if (auto* w = dynamic_cast<Weapon*>(carriedEquip)) (void)P->SetWeapon(w);   // vfB4
+    quickLoading = false;                             // DAT_002EAA48 = 0
+    // Lives survive the respawn, so restore the counter without replaying AddPickupValue's 25-point extra-life award.
+    for (s32 value : carriedValues)
+        if (bookValue) pickupValue += value;
     events.ResetIndexed(P->IngameContext());          // (D+0x28)->0x000F2980
     nibblerPending.clear();                           // (S+0x1FC)->0x00077900 (entries zeroed, size / count 0)
     events.enabled = true;                            // 0x000E0220(1)
